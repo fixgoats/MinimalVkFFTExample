@@ -1,3 +1,5 @@
+#define VMA_IMPLEMENTATION
+#include "vk_mem_alloc.h"
 #include <algorithm>
 #include <cstdint>
 #include <fstream>
@@ -32,6 +34,23 @@ vk::raii::Instance makeInstance(const vk::raii::Context &context) {
                                             Layers,   // Layers
                                             {});      // Extensions
   return vk::raii::Instance(context, InstanceCreateInfo);
+}
+
+template <typename Func>
+void oneTimeSubmit(const vk::raii::Device &device,
+                   const vk::raii::CommandPool &commandPool,
+                   const vk::raii::Queue &queue, const Func &func) {
+  vk::raii::CommandBuffer commandBuffer =
+      std::move(vk::raii::CommandBuffers(
+                    device, {*commandPool, vk::CommandBufferLevel::ePrimary, 1})
+                    .front());
+  commandBuffer.begin(vk::CommandBufferBeginInfo(
+      vk::CommandBufferUsageFlagBits::eOneTimeSubmit));
+  func(*commandBuffer);
+  commandBuffer.end();
+  vk::SubmitInfo submitInfo(nullptr, nullptr, *commandBuffer);
+  queue.submit(submitInfo, nullptr);
+  queue.waitIdle();
 }
 
 vk::raii::PhysicalDevice pickPhysicalDevice(const vk::raii::Instance &instance,
@@ -118,46 +137,6 @@ int main(int argc, char *argv[]) {
   vk::raii::Device device(physicalDevice, dCI);
   vk::raii::Queue queue(device, computeQueueFamilyIndex, 0);
   vk::raii::Fence fence(device, vk::FenceCreateInfo());
-
-  constexpr uint64_t nElements = 1024;
-  uint64_t bufferSize = nElements * sizeof(c32);
-
-  vk::raii::DeviceMemory inBM(nullptr);
-  vk::BufferCreateInfo bCI{vk::BufferCreateFlags(),
-                           bufferSize,
-                           vk::BufferUsageFlagBits::eStorageBuffer,
-                           vk::SharingMode::eExclusive,
-                           1,
-                           &computeQueueFamilyIndex};
-  vk::raii::Buffer inBuffer(device, bCI);
-  vk::MemoryRequirements inBMR = inBuffer.getMemoryRequirements();
-  auto memProps = physicalDevice.getMemoryProperties();
-  uint32_t memoryTypeIndex = uint32_t(~0);
-  vk::DeviceSize memoryHeapSize = uint32_t(~0);
-  for (uint32_t curMemoryTypeIndex = 0;
-       curMemoryTypeIndex < memProps.memoryTypeCount; ++curMemoryTypeIndex) {
-    vk::MemoryType memoryType = memProps.memoryTypes[curMemoryTypeIndex];
-    if ((vk::MemoryPropertyFlagBits::eHostVisible & memoryType.propertyFlags) &&
-        (vk::MemoryPropertyFlagBits::eHostCoherent &
-         memoryType.propertyFlags)) {
-      memoryHeapSize = memProps.memoryHeaps[memoryType.heapIndex].size;
-      memoryTypeIndex = curMemoryTypeIndex;
-      break;
-    }
-  }
-  vk::MemoryAllocateInfo inBMAI(inBMR.size, memoryTypeIndex);
-  inBM = vk::raii::DeviceMemory(device, inBMAI);
-
-  c32 *inBufferPtr = static_cast<c32 *>(inBM.mapMemory(0, bufferSize));
-  constexpr float startX = -3.0;
-  constexpr float endX = 3.0;
-  for (int32_t i = 0; i < nElements; i++) {
-    inBufferPtr[i] = std::exp(c64{
-        -square(startX + ((float)i / (float)nElements) * (endX - startX)), 0.});
-  }
-  inBM.unmapMemory();
-  inBuffer.bindMemory(*inBM, 0);
-
   vk::CommandPoolCreateInfo commandPoolCreateInfo(vk::CommandPoolCreateFlags(),
                                                   computeQueueFamilyIndex);
   vk::raii::CommandPool commandPool(device, commandPoolCreateInfo);
@@ -166,8 +145,75 @@ int main(int argc, char *argv[]) {
   vk::raii::CommandBuffers commandBuffers(device, cBAI);
   vk::raii::CommandBuffer commandBuffer(std::move(commandBuffers[0]));
 
+  constexpr uint64_t nElements = 1024;
+  uint64_t bufferSize = nElements * sizeof(c32);
+
+  VmaAllocatorCreateInfo allocatorInfo{};
+  allocatorInfo.physicalDevice = *physicalDevice;
+  allocatorInfo.vulkanApiVersion = physicalDevice.getProperties().apiVersion;
+  allocatorInfo.device = *device;
+  allocatorInfo.instance = *instance;
+
+  VmaAllocator allocator;
+  vmaCreateAllocator(&allocatorInfo, &allocator);
+
+  vk::BufferCreateInfo stagingBCI({}, bufferSize,
+                                  vk::BufferUsageFlagBits::eTransferSrc |
+                                      vk::BufferUsageFlagBits::eTransferDst);
+
+  VmaAllocationCreateInfo allocCreateInfo{};
+  allocCreateInfo.usage = VMA_MEMORY_USAGE_AUTO;
+  allocCreateInfo.flags =
+      VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+      VMA_ALLOCATION_CREATE_MAPPED_BIT;
+  VkBuffer stagingBufferRaw;
+  VmaAllocation stagingAlloc;
+  VmaAllocationInfo stAI;
+  vmaCreateBuffer(allocator,
+                  reinterpret_cast<VkBufferCreateInfo *>(&stagingBCI),
+                  &allocCreateInfo, &stagingBufferRaw, &stagingAlloc, &stAI);
+  vk::Buffer stagingBuffer = stagingBufferRaw;
+
+  vk::BufferCreateInfo stateBCI{vk::BufferCreateFlags(),
+                                bufferSize,
+                                vk::BufferUsageFlagBits::eStorageBuffer |
+                                    vk::BufferUsageFlagBits::eTransferDst |
+                                    vk::BufferUsageFlagBits::eTransferSrc,
+                                vk::SharingMode::eExclusive,
+                                1,
+                                &computeQueueFamilyIndex};
+  allocCreateInfo.flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
+  allocCreateInfo.priority = 1.0f;
+  VkBuffer inBufferRaw;
+  VmaAllocation inBufferAlloc;
+  VmaAllocationInfo inBufferAI;
+  vmaCreateBuffer(allocator, reinterpret_cast<VkBufferCreateInfo *>(&stateBCI),
+                  &allocCreateInfo, &inBufferRaw, &inBufferAlloc, &inBufferAI);
+  vk::Buffer inBuffer = inBufferRaw;
+
+  VkBuffer outBufferRaw;
+  VmaAllocation outBufferAlloc;
+  VmaAllocationInfo outBufferAI;
+  vmaCreateBuffer(allocator, reinterpret_cast<VkBufferCreateInfo *>(&stateBCI),
+                  &allocCreateInfo, &inBufferRaw, &inBufferAlloc, &inBufferAI);
+  vk::Buffer outBuffer = outBufferRaw;
+
+  c32 *stagingPtr = static_cast<c32 *>(stAI.pMappedData);
+  constexpr float startX = -3.0;
+  constexpr float endX = 3.0;
+  for (int32_t i = 0; i < nElements; i++) {
+    stagingPtr[i] = std::exp(c64{
+        -square(startX + ((float)i / (float)nElements) * (endX - startX)), 0.});
+  }
+
+  oneTimeSubmit(device, commandPool, queue,
+                [&](vk::CommandBuffer const &commandBuffer) {
+                  commandBuffer.copyBuffer(stagingBuffer, inBuffer,
+                                           vk::BufferCopy(0, 0, bufferSize));
+                });
+
   VkFFTConfiguration conf = {};
-  VkFFTApplication app = {};
+  VkFFTApplication app1 = {};
   conf.device = (VkDevice *)&*device;
   conf.FFTdim = 1;
   conf.size[0] = 1024;
@@ -176,11 +222,15 @@ int main(int argc, char *argv[]) {
   conf.fence = (VkFence *)&*fence;
   conf.commandPool = (VkCommandPool *)&*commandPool;
   conf.physicalDevice = (VkPhysicalDevice *)&*physicalDevice;
-  conf.buffer = (VkBuffer *)&*inBuffer;
+  conf.isInputFormatted = true;
+  conf.inputBuffer = (VkBuffer *)&*inBuffer;
+  conf.buffer = (VkBuffer *)&*outBuffer;
   conf.bufferSize = &bufferSize;
-  conf.disableSetLocale = true;
+  conf.inputBufferSize = &bufferSize;
+  conf.inverseReturnToInputBuffer = true;
 
-  auto resFFT = initializeVkFFT(&app, conf);
+  auto resFFT = initializeVkFFT(&app1, conf);
+
   std::cout << resFFT << '\n';
   VkFFTLaunchParams launchParams = {};
 
