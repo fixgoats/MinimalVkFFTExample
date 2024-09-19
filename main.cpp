@@ -303,25 +303,30 @@ std::vector<c32> doTheCalculation() {
        &outBufferInfo}};
   device.updateDescriptorSets(writeDescriptorSets, {});
 
-  VkFFTConfiguration conf = {};
-  VkFFTApplication app = {};
+  VkFFTConfiguration conf{};
+  VkFFTApplication app{};
   conf.device = (VkDevice *)&*device;
   conf.FFTdim = 1;
   conf.size[0] = nElements;
-  conf.numberBatches = 1;
   conf.queue = (VkQueue *)&*queue;
   conf.fence = (VkFence *)&*fence;
   conf.commandPool = (VkCommandPool *)&*commandPool;
   conf.physicalDevice = (VkPhysicalDevice *)&*physicalDevice;
-  conf.isInputFormatted = true;
-  conf.inputBuffer = (VkBuffer *)&in.buffer;
-  conf.buffer = (VkBuffer *)&out.buffer;
+  conf.buffer = (VkBuffer *)&in.buffer;
   conf.bufferSize = &bufferSize;
-  conf.inputBufferSize = &bufferSize;
-  conf.inverseReturnToInputBuffer = true;
+  conf.disableSetLocale = true;
+  // conf.coordinateFeatures = 1;
+  // conf.matrixConvolution = 1;
+  // conf.kernelConvolution = true;
 
   auto resFFT = initializeVkFFT(&app, conf);
+  // conf.performConvolution = true;
+  // conf.kernelConvolution = false;
+  // conf.kernel = (VkBuffer *)&kernel.buffer;
+  // conf.buffer = (VkBuffer *)&in.buffer;
+  // conf.kernelSize = &bufferSize;
 
+  // resFFT = initializeVkFFT(&app, conf);
   VkFFTLaunchParams launchParams = {};
 
   vk::MemoryBarrier memoryBarrier(
@@ -332,16 +337,17 @@ std::vector<c32> doTheCalculation() {
   commandBuffer.begin(cBBI);
   launchParams.commandBuffer = (VkCommandBuffer *)&*commandBuffer;
   resFFT = VkFFTAppend(&app, -1, &launchParams);
-  commandBuffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
-                                vk::PipelineStageFlagBits::eAllCommands, {},
-                                memoryBarrier, nullptr, nullptr);
-  commandBuffer.bindPipeline(vk::PipelineBindPoint::eCompute, *computePipeline);
-  commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eCompute,
-                                   *pipelineLayout, 0, {*descriptorSet}, {});
-  commandBuffer.dispatch(nElements / 32, 1, 1);
-  commandBuffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
-                                vk::PipelineStageFlagBits::eAllCommands, {},
-                                memoryBarrier, nullptr, nullptr);
+  // commandBuffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+  //                               vk::PipelineStageFlagBits::eAllCommands, {},
+  //                               memoryBarrier, nullptr, nullptr);
+  // commandBuffer.bindPipeline(vk::PipelineBindPoint::eCompute,
+  // *computePipeline);
+  // commandBuffer.bindDescriptorSets(vk::PipelineBindPoint::eCompute,
+  //                                  *pipelineLayout, 0, {*descriptorSet}, {});
+  // commandBuffer.dispatch(nElements / 32, 1, 1);
+  // commandBuffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+  //                               vk::PipelineStageFlagBits::eAllCommands, {},
+  //                               memoryBarrier, nullptr, nullptr);
   resFFT = VkFFTAppend(&app, 1, &launchParams);
   commandBuffer.end();
 
@@ -351,7 +357,7 @@ std::vector<c32> doTheCalculation() {
 
   oneTimeSubmit(device, commandPool, queue,
                 [&](vk::CommandBuffer const &commandBuffer) {
-                  commandBuffer.copyBuffer(in.buffer, staging.buffer,
+                  commandBuffer.copyBuffer(out.buffer, staging.buffer,
                                            vk::BufferCopy(0, 0, bufferSize));
                 });
 
